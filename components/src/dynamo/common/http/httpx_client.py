@@ -36,14 +36,9 @@ logger = logging.getLogger(__name__)
 
 
 class _PinningTransport(httpx.AsyncHTTPTransport):
-    """httpx transport that pins the connection to a non-blocked resolved IP.
-
-    httpx exposes no DNS-resolver hook, so we resolve + filter here (reusing the
-    shared blocklist) and dial a specific IP while keeping the original hostname
-    for SNI / ``Host`` / certificate verification. This closes the same
-    DNS-rebinding gap the aiohttp backend closes with its resolver — the
-    connect-time backstop behind ``validate_url``'s pre-check.
-    """
+    """Pins the connection to a non-blocked resolved IP (httpx has no resolver
+    hook), keeping the hostname for SNI/Host/cert. The httpx equivalent of the
+    aiohttp BlocklistResolver — see _ssrf_resolver."""
 
     def __init__(self, *, allow_private_ips: bool, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -56,8 +51,7 @@ class _PinningTransport(httpx.AsyncHTTPTransport):
                 host, allow_private_ips=self._allow_private_ips
             )
             if ip != host:
-                # Preserve the original authority for TLS SNI + cert check and
-                # the Host header; only the dialed address becomes the IP.
+                # Dial the IP but keep the hostname for SNI / Host / cert check.
                 request.extensions = dict(request.extensions)
                 request.extensions.setdefault("sni_hostname", host)
                 request.headers["Host"] = request.url.netloc.decode("ascii")
