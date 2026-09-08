@@ -28,9 +28,41 @@ from typing import Optional
 
 import httpx
 
+from ._ssrf_resolver import resolve_allowed_ip
 from .base import HttpClient, HttpConnectionError, HttpStatusError, HttpTimeoutError
+from .url_validator import UrlValidationPolicy
 
 logger = logging.getLogger(__name__)
+
+
+class _PinningTransport(httpx.AsyncHTTPTransport):
+    """httpx transport that pins the connection to a non-blocked resolved IP.
+
+    httpx exposes no DNS-resolver hook, so we resolve + filter here (reusing the
+    shared blocklist) and dial a specific IP while keeping the original hostname
+    for SNI / ``Host`` / certificate verification. This closes the same
+    DNS-rebinding gap the aiohttp backend closes with its resolver — the
+    connect-time backstop behind ``validate_url``'s pre-check.
+    """
+
+    def __init__(self, *, allow_private_ips: bool, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._allow_private_ips = allow_private_ips
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        if host:
+            ip = await resolve_allowed_ip(
+                host, allow_private_ips=self._allow_private_ips
+            )
+            if ip != host:
+                # Preserve the original authority for TLS SNI + cert check and
+                # the Host header; only the dialed address becomes the IP.
+                request.extensions = dict(request.extensions)
+                request.extensions.setdefault("sni_hostname", host)
+                request.headers["Host"] = request.url.netloc.decode("ascii")
+                request.url = request.url.copy_with(host=ip)
+        return await super().handle_async_request(request)
 
 
 class HttpxClient(HttpClient):
@@ -69,13 +101,20 @@ class HttpxClient(HttpClient):
         )
 
     def _build_client(self) -> httpx.AsyncClient:
+        limits = httpx.Limits(
+            max_connections=self._config.max_connections,
+            max_keepalive_connections=self._config.max_keepalive,
+        )
+        # Connect-time SSRF backstop (see _PinningTransport); allow_private_ips
+        # follows the same env knob the fetch policy uses.
+        transport = _PinningTransport(
+            allow_private_ips=UrlValidationPolicy.from_env().allow_private_ips,
+            limits=limits,
+        )
         return httpx.AsyncClient(
             timeout=self._per_call_timeout(60.0),
             follow_redirects=True,
-            limits=httpx.Limits(
-                max_connections=self._config.max_connections,
-                max_keepalive_connections=self._config.max_keepalive,
-            ),
+            transport=transport,
         )
 
     async def _get_client(self) -> httpx.AsyncClient:
