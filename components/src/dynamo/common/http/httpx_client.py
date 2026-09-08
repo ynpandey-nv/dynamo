@@ -47,9 +47,15 @@ class _PinningTransport(httpx.AsyncHTTPTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
         if host:
-            ip = await resolve_allowed_ip(
-                host, allow_private_ips=self._allow_private_ips
-            )
+            try:
+                ip = await resolve_allowed_ip(
+                    host, allow_private_ips=self._allow_private_ips
+                )
+            except OSError as exc:
+                # SsrfBlockedAddress and DNS failures both subclass OSError and
+                # fire before httpx connects; surface as a httpx error so the
+                # facade normalizes them to HttpConnectionError, not a raw OSError.
+                raise httpx.ConnectError(str(exc), request=request) from exc
             if ip != host:
                 # Dial the IP but keep the hostname for SNI / Host / cert check.
                 request.extensions = dict(request.extensions)
